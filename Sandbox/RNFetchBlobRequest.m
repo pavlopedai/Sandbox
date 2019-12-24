@@ -115,6 +115,9 @@ typedef NS_ENUM(NSUInteger, ResponseFormat) {
     
     if (backgroundTask) {
         defaultConfigObject = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:taskId];
+        defaultConfigObject.timeoutIntervalForRequest = 600.0;
+        defaultConfigObject.timeoutIntervalForResource = 600.0;
+        defaultConfigObject.sessionSendsLaunchEvents = YES;
     }
     
     // request timeout, -1 if not set in options
@@ -157,8 +160,13 @@ typedef NS_ENUM(NSUInteger, ResponseFormat) {
         respFile = NO;
     }
     
-    self.task = [session dataTaskWithRequest:req];
-    [self.task resume];
+    if (backgroundTask) {
+        self.downloadTask = [session downloadTaskWithRequest:req];
+        [self.downloadTask resume];
+    } else {
+        self.task = [session dataTaskWithRequest:req];
+        [self.task resume];
+    }
     
     // network status indicator
     if ([[options objectForKey:CONFIG_INDICATOR] boolValue]) {
@@ -177,6 +185,77 @@ typedef NS_ENUM(NSUInteger, ResponseFormat) {
 
 #pragma mark NSURLSession delegate methods
 
+- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didFinishDownloadingToURL:(NSURL *)location {
+    
+    if (respStatus == 0) {
+        respStatus = 200;
+        [self.bridge.eventDispatcher
+        sendDeviceEventWithName: EVENT_STATE_CHANGE
+        body:@{
+               @"taskId": taskId,
+               @"state": @"2",
+               @"headers": @[],
+               @"redirects": redirects,
+               @"respType" : RESP_TYPE_PATH,
+               @"timeout" : @NO,
+               @"status": [NSNumber numberWithInteger:respStatus]
+               }
+        ];
+    }
+    
+    NSString * errMsg;
+    
+    NSFileManager * fm = [NSFileManager defaultManager];
+    NSString * folder = [destPath stringByDeletingLastPathComponent];
+        
+    if (![fm fileExistsAtPath:folder]) {
+        [fm createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:NULL error:nil];
+    }
+        
+    if (![fm fileExistsAtPath:destPath]) {
+        NSError *writeError;
+        [[NSFileManager defaultManager] moveItemAtPath:location.path toPath:destPath error:&writeError];
+        errMsg = writeError.localizedDescription;
+    }
+    
+    if ([[options objectForKey:CONFIG_INDICATOR] boolValue]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[UIApplication sharedApplication] setNetworkActivityIndicatorVisible:NO];
+        });
+    }
+    
+    callback(@[
+               errMsg ?: [NSNull null],
+               RESP_TYPE_PATH,
+               destPath
+               ]);
+    
+    respData = nil;
+    receivedBytes = 0;
+    respStatus = 0;
+    [session finishTasksAndInvalidate];
+}
+
+- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
+
+    receivedBytes = totalBytesWritten;
+    expectedBytes = totalBytesExpectedToWrite;
+    NSString * chunkString = @"";
+    
+    NSNumber * now =[NSNumber numberWithFloat:((float)receivedBytes/(float)expectedBytes)];
+    
+    if ([self.progressConfig shouldReport:now]) {
+        [self.bridge.eventDispatcher
+         sendDeviceEventWithName:EVENT_PROGRESS
+         body:@{
+                @"taskId": taskId,
+                @"written": [NSString stringWithFormat:@"%lld", (long long) receivedBytes],
+                @"total": [NSString stringWithFormat:@"%lld", (long long) expectedBytes],
+                @"chunk": chunkString
+                }
+         ];
+    }
+}
 
 #pragma mark - Received Response
 // set expected content length on response received
@@ -363,6 +442,12 @@ typedef NS_ENUM(NSUInteger, ResponseFormat) {
 
 - (void) URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error
 {
+    if (self.downloadTask != nil && error == nil) {
+        //For URLDownloadTask this callback goes before file is written to temp location so we don't have data here. Need to wait for "URLSession: downloadTask: didFinishDownloadingToURL:" Completion logic for DownloadTask is handled there.
+        return;
+    }
+    
+    //Proceed completion for URLDataTasks
     
     self.error = error;
     NSString * errMsg;
